@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  build:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+
+      # No Rust cache for release builds — cache can cause stale version
+      # strings when only tauri.conf.json version changes between releases.
+
+      - run: npm ci
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ needs.release-please.outputs.tag_name }}
+          releaseName: ${{ needs.release-please.outputs.tag_name }}
+          args: --target ${{ matrix.target }}
+
+  update-homebrew:
+    needs: [release-please, build]
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - id: version
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+
+      - id: sha-arm
+        run: |
+          curl -fSL -o 0ma-arm.dmg "https://github.com/chenhunghan/0ma/releases/download/v${{ steps.version.outputs.version }}/0ma_${{ steps.version.outputs.version }}_aarch64.dmg"
+          echo "sha256=$(shasum -a 256 0ma-arm.dmg | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - id: sha-intel
+        run: |
+          curl -fSL -o 0ma-intel.dmg "https://github.com/chenhunghan/0ma/releases/download/v${{ steps.version.outputs.version }}/0ma_${{ steps.version.outputs.version }}_x64.dmg"
+          echo "sha256=$(shasum -a 256 0ma-intel.dmg | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA_ARM: ${{ steps.sha-arm.outputs.sha256 }}
+          SHA_INTEL: ${{ steps.sha-intel.outputs.sha256 }}
+        shell: bash
+        run: |
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/chenhunghan/homebrew-tap.git"
+          cd homebrew-tap
+          printf 'cask "0ma" do\n  version "%s"\n\n  on_arm do\n    sha256 "%s"\n\n    url "https://github.com/chenhunghan/0ma/releases/download/v#{version}/0ma_#{version}_aarch64.dmg"\n  end\n  on_intel do\n    sha256 "%s"\n\n    url "https://github.com/chenhunghan/0ma/releases/download/v#{version}/0ma_#{version}_x64.dmg"\n  end\n\n  name "0ma"\n  desc "Desktop GUI for managing Lima instances and Kubernetes clusters"\n  homepage "https://github.com/chenhunghan/0ma"\n\n  depends_on :macos\n\n  app "0ma.app"\n\n  postflight_steps do\n    run "/usr/bin/xattr", args: ["-cr", "{{appdir}}/0ma.app"]\n  end\nend\n' "$VERSION" "$SHA_ARM" "$SHA_INTEL" > Casks/0ma.rb
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Casks/0ma.rb
+          git commit -m "chore: update 0ma to $VERSION"
+          git push
